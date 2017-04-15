@@ -70,8 +70,6 @@
 #  define TLS_MODEL
 #  define _Static_assert static_assert
 #  define _Thread_local __declspec(thread)
-#  define atomic_thread_fence_acquire() //_ReadWriteBarrier()
-#  define atomic_thread_fence_release() //_ReadWriteBarrier()
 #  if ENABLE_VALIDATE_ARGS
 #    include <Intsafe.h>
 #  endif
@@ -80,7 +78,6 @@
 #  if !defined(__clang__) && defined(__GNUC__)
 #    define _Thread_local __thread
 #  endif
-#  include <stdatomic.h>
 #endif
 
 #if defined( __x86_64__ ) || defined( _M_AMD64 ) || defined( _M_X64 ) || defined( _AMD64_ ) || defined( __arm64__ ) || defined( __aarch64__ )
@@ -96,6 +93,7 @@
 #endif
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #if ENABLE_ASSERTS
