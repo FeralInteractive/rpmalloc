@@ -116,6 +116,17 @@
 #  define assert(x)
 #endif
 
+#if defined( _WIN32 ) || defined( __WIN32__ ) || defined( _WIN64 )
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <sched.h>
+#  ifndef MAP_UNINITIALIZED
+#    define MAP_UNINITIALIZED 0
+#  endif
+#endif
+#include <errno.h>
+
 // Atomic access abstraction
 ALIGNED_STRUCT(atomic32_t, 4) {
 	int32_t nonatomic;
@@ -141,20 +152,6 @@ static FORCEINLINE void
 atomic_store32(atomic32_t* dst, int32_t val) {
 	dst->nonatomic = val;
 }
-
-#if PLATFORM_POSIX
-
-static FORCEINLINE void
-atomic_store64(atomic64_t* dst, int64_t val) {
-	dst->nonatomic = val;
-}
-
-static FORCEINLINE int64_t
-atomic_exchange_and_add64(atomic64_t* dst, int64_t add) {
-	return __sync_fetch_and_add(&dst->nonatomic, add);
-}
-
-#endif
 
 static FORCEINLINE int32_t
 atomic_incr32(atomic32_t* val) {
@@ -244,7 +241,7 @@ thread_yield(void);
 #define pointer_diff(first, second) (ptrdiff_t)((const char*)(first) - (const char*)(second))
 
 //! Size of a span header
-#define SPAN_HEADER_SIZE          32
+#define SPAN_HEADER_SIZE          40
 
 #if ARCH_64BIT
 typedef int64_t offset_t;
@@ -298,6 +295,8 @@ struct span_t {
 	count_t     size_class;
 	//! Span data
 	span_data_t data;
+	//! Alignment offset
+	size_t		align_offset;
 	//! Next span
 	span_t*     next_span;
 	//! Previous span
@@ -333,6 +332,8 @@ struct heap_t {
 	span_t*      large_cache[LARGE_CLASS_COUNT];
 	//! Allocation counters for large blocks
 	span_counter_t large_counter[LARGE_CLASS_COUNT];
+	//! Alignment offset
+	size_t		align_offset;
 	//! Next heap in id list
 	heap_t*      next_heap;
 	//! Next heap in orphan list
@@ -362,16 +363,14 @@ struct size_class_t {
 };
 _Static_assert(sizeof(size_class_t) == 8, "Size class size mismatch");
 
+//! Configuration
+static rpmalloc_config_t _memory_config;
+
 //! Global size classes
 static size_class_t _memory_size_class[SIZE_CLASS_COUNT];
 
 //! Heap ID counter
 static atomic32_t _memory_heap_id;
-
-#ifdef PLATFORM_POSIX
-//! Virtual memory address counter
-static atomic64_t _memory_addr;
-#endif
 
 //! Global span cache
 static atomicptr_t _memory_span_cache[SPAN_CLASS_COUNT];
@@ -441,13 +440,41 @@ set_thread_heap(heap_t* heap) {
 }
 
 static void*
-_memory_map(size_t page_count);
+_memory_map(size_t page_count, size_t* align_offset);
 
 static void
-_memory_unmap(void* ptr, size_t page_count);
+_memory_unmap(void* ptr, size_t page_count, size_t align_offset);
 
 static int
 _memory_deallocate_deferred(heap_t* heap, size_t size_class);
+
+//! Map new pages to virtual memory
+static void*
+_memory_map_os(size_t size) {
+	void* pages_ptr = 0;
+
+#ifdef PLATFORM_WINDOWS
+	pages_ptr = VirtualAlloc(0, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif PLATFORM_POSIX
+	pages_ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
+	if (pages_ptr == MAP_FAILED)
+		pages_ptr = 0;
+#endif
+
+	return pages_ptr;
+}
+
+//! Unmap pages from virtual memory
+static void
+_memory_unmap_os(void* ptr, size_t size) {
+
+#ifdef PLATFORM_WINDOWS
+	VirtualFree(ptr, 0, MEM_RELEASE);
+	(void)sizeof(size);
+#elif PLATFORM_POSIX
+	munmap(ptr, size);
+#endif
+}
 
 //! Lookup a memory heap from heap ID
 static heap_t*
@@ -521,7 +548,7 @@ _memory_global_cache_insert(span_t* first_span, size_t list_size, size_t page_co
 	for (size_t ispan = 0; ispan < list_size; ++ispan) {
 		assert(first_span);
 		span_t* next_span = first_span->next_span;
-		_memory_unmap(first_span, page_count);
+		_memory_unmap(first_span, page_count, first_span->align_offset);
 		first_span = next_span;
 	}
 }
@@ -604,7 +631,7 @@ _memory_global_cache_large_insert(span_t* span_list, size_t list_size, size_t sp
 	for (size_t ispan = 0; ispan < list_size; ++ispan) {
 		assert(span_list);
 		span_t* next_span = span_list->next_span;
-		_memory_unmap(span_list, span_count * SPAN_MAX_PAGE_COUNT);
+		_memory_unmap(span_list, span_count * SPAN_MAX_PAGE_COUNT, span_list->align_offset);
 		span_list = next_span;
 	}
 }
@@ -748,7 +775,9 @@ use_active:
 	}
 	else {
 		//Step 6: All caches empty, map in new memory pages
-		span = _memory_map(size_class->page_count);
+		size_t align_offset;
+		span = _memory_map(size_class->page_count, &align_offset);
+		span->align_offset = align_offset;
 	}
 
 	//Mark span as owned by this heap and set base data
@@ -822,7 +851,9 @@ _memory_allocate_large_from_heap(heap_t* heap, size_t size) {
 		}
 		else {
 			//Step 6: All caches empty, map in new memory pages
-			span = _memory_map(SPAN_MAX_PAGE_COUNT);
+			size_t align_offset;
+			span = _memory_map(SPAN_MAX_PAGE_COUNT, &align_offset);
+			span->align_offset = align_offset;
 		}
 
 		//Mark span as owned by this heap and set base data
@@ -887,7 +918,9 @@ use_cache:
 	}
 	else {
 		//Step 4: Map in more memory pages
-		span = _memory_map(num_spans * SPAN_MAX_PAGE_COUNT);
+		size_t align_offset;
+		span = _memory_map(num_spans * SPAN_MAX_PAGE_COUNT, &align_offset);
+		span->align_offset = align_offset;
 	}
 	//Mark span as owned by this heap
 	atomic_store32(&span->heap_id, heap->id);
@@ -927,8 +960,10 @@ _memory_allocate_heap(void) {
 	}
 
 	//Map in pages for a new heap
-	heap = _memory_map(2);
+	size_t align_offset;
+	heap = _memory_map(2, &align_offset);
 	memset(heap, 0, sizeof(heap_t));
+	heap->align_offset = align_offset;
 
 	//Get a new heap ID
 	do {
@@ -1182,7 +1217,9 @@ _memory_allocate(size_t size) {
 	size_t num_pages = size / PAGE_SIZE;
 	if (size % PAGE_SIZE)
 		++num_pages;
-	span_t* span = _memory_map(num_pages);
+	size_t align_offset;
+	span_t* span = _memory_map(num_pages, &align_offset);
+	span->align_offset = align_offset;
 	atomic_store32(&span->heap_id, 0);
 	//Store page count in next_span
 	span->next_span = (span_t*)((uintptr_t)num_pages);
@@ -1213,7 +1250,7 @@ _memory_deallocate(void* p) {
 	else {
 		//Oversized allocation, page count is stored in next_span
 		size_t num_pages = (size_t)span->next_span;
-		_memory_unmap(span, num_pages);
+		_memory_unmap(span, num_pages, span->align_offset);
 	}
 }
 
@@ -1330,20 +1367,15 @@ _memory_adjust_size_class(size_t iclass) {
 	}
 }
 
-#if defined( _WIN32 ) || defined( __WIN32__ ) || defined( _WIN64 )
-#  include <windows.h>
-#else
-#  include <sys/mman.h>
-#  include <sched.h>
-#  ifndef MAP_UNINITIALIZED
-#    define MAP_UNINITIALIZED 0
-#  endif
-#endif
-#include <errno.h>
-
 //! Initialize the allocator and setup global data
 int
 rpmalloc_initialize(void) {
+	return(rpmalloc_initialize_config(0));
+}
+
+//! Initialize the allocator and setup global data
+int
+rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 #ifdef PLATFORM_WINDOWS
 	SYSTEM_INFO system_info;
 	memset(&system_info, 0, sizeof(system_info));
@@ -1355,15 +1387,16 @@ rpmalloc_initialize(void) {
 	if (pthread_key_create(&_memory_thread_heap, 0))
 		return -1;
 #  endif
-#  if ARCH_64BIT
-	atomic_store64(&_memory_addr, 0x1000000000ULL);
-#  else
-	atomic_store64(&_memory_addr, 0x1000000ULL);
-#  endif
 #endif
 
 	atomic_store32(&_memory_heap_id, 0);
 	atomic_store32(&_memory_orphan_counter, 0);
+
+	_memory_config.memory_map   = _memory_map_os;
+	_memory_config.memory_unmap = _memory_unmap_os;
+
+	if (config != 0)
+		memcpy(&_memory_config, config, sizeof(_memory_config));
 
 	//Setup all small and medium size classes
 	size_t iclass;
@@ -1402,7 +1435,7 @@ rpmalloc_finalize(void) {
 				unsigned int span_count = span ? span->data.list_size : 0;
 				for (unsigned int ispan = 0; ispan < span_count; ++ispan) {
 					span_t* next_span = span->next_span;
-					_memory_unmap(span, page_count);
+					_memory_unmap(span, page_count, span->align_offset);
 					span = next_span;
 				}
 			}
@@ -1413,13 +1446,13 @@ rpmalloc_finalize(void) {
 				span_t* span = heap->large_cache[iclass];
 				while (span) {
 					span_t* next_span = span->next_span;
-					_memory_unmap(span, span_count * SPAN_MAX_PAGE_COUNT);
+					_memory_unmap(span, span_count * SPAN_MAX_PAGE_COUNT, span->align_offset);
 					span = next_span;
 				}
 			}
 
 			heap_t* next_heap = heap->next_heap;
-			_memory_unmap(heap, 2);
+			_memory_unmap(heap, 2, heap->align_offset);
 			heap = next_heap;
 		}
 
@@ -1437,7 +1470,7 @@ rpmalloc_finalize(void) {
 			unsigned int span_count = span->data.list_size;
 			for (unsigned int ispan = 0; ispan < span_count; ++ispan) {
 				span_t* next_span = span->next_span;
-				_memory_unmap(span, (iclass + 1) * SPAN_CLASS_GRANULARITY);
+				_memory_unmap(span, (iclass + 1) * SPAN_CLASS_GRANULARITY, span->align_offset);
 				span = next_span;
 			}
 			span = skip_span;
@@ -1455,7 +1488,7 @@ rpmalloc_finalize(void) {
 			unsigned int span_count = span->data.list_size;
 			for (unsigned int ispan = 0; ispan < span_count; ++ispan) {
 				span_t* next_span = span->next_span;
-				_memory_unmap(span, (iclass + 1) * SPAN_MAX_PAGE_COUNT);
+				_memory_unmap(span, (iclass + 1) * SPAN_MAX_PAGE_COUNT, span->align_offset);
 				span = next_span;
 			}
 			span = skip_span;
@@ -1580,40 +1613,40 @@ rpmalloc_is_thread_initialized(void) {
 
 //! Map new pages to virtual memory
 static void*
-_memory_map(size_t page_count) {
-	size_t total_size = page_count * PAGE_SIZE;
-	void* pages_ptr = 0;
+_memory_map(size_t page_count, size_t* align_offset) {
+	uintptr_t mapped_addr, aligned_addr;
+	void* pages_ptr;
+
+
+	//Allocate pages
+	mapped_addr  = (uintptr_t) (void*) _memory_config.memory_map(page_count * PAGE_SIZE);
+
+	if ((mapped_addr & ~SPAN_MASK) == 0)
+		aligned_addr = mapped_addr;
+	else
+	{
+		//Retry with space for alignment
+		_memory_config.memory_unmap((void *) mapped_addr, page_count * PAGE_SIZE);
+
+		page_count += (SPAN_ADDRESS_GRANULARITY / PAGE_SIZE);
+		mapped_addr = (uintptr_t) (void*) _memory_config.memory_map(page_count * PAGE_SIZE);
+
+
+		//Align as necessary
+		if ((mapped_addr & ~SPAN_MASK) == 0)
+			aligned_addr = mapped_addr;
+		else
+			aligned_addr = mapped_addr + SPAN_ADDRESS_GRANULARITY - (mapped_addr % SPAN_ADDRESS_GRANULARITY);
+	}
+
+
+	//Return the aligned page/offset
+	pages_ptr     = (void *) aligned_addr;
+	*align_offset = (aligned_addr - mapped_addr);
 
 #if ENABLE_STATISTICS
-	atomic_add32(&_mapped_pages, (int32_t)page_count);
-	atomic_add32(&_mapped_total, (int32_t)page_count);
-#endif
-
-#ifdef PLATFORM_WINDOWS
-	pages_ptr = VirtualAlloc(0, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-	//mmap lacks a way to set 64KiB address granularity, implement it locally
-	intptr_t incr = (intptr_t)total_size / (intptr_t)SPAN_ADDRESS_GRANULARITY;
-	if (total_size % SPAN_ADDRESS_GRANULARITY)
-		++incr;
-	do {
-		void* base_addr = (void*)(uintptr_t)atomic_exchange_and_add64(&_memory_addr,
-		                  (incr * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-		pages_ptr = mmap(base_addr, total_size, PROT_READ | PROT_WRITE,
-		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
-		if (pages_ptr != MAP_FAILED) {
-			if (pages_ptr != base_addr) {
-				void* new_base = (void*)((uintptr_t)pages_ptr & SPAN_MASK);
-				atomic_store64(&_memory_addr, (int64_t)((uintptr_t)new_base) +
-							   ((incr + 1) * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-				atomic_thread_fence_release();
-			}
-			if (!((uintptr_t)pages_ptr & ~SPAN_MASK))
-				break;
-			munmap(pages_ptr, total_size);
-		}
-	}
-	while (1);
+	atomic_add32(&_mapped_pages, (int32_t) page_count);
+	atomic_add32(&_mapped_total, (int32_t) page_count);
 #endif
 
 	return pages_ptr;
@@ -1621,17 +1654,17 @@ _memory_map(size_t page_count) {
 
 //! Unmap pages from virtual memory
 static void
-_memory_unmap(void* ptr, size_t page_count) {
-#if ENABLE_STATISTICS
-	atomic_add32(&_mapped_pages, -(int32_t)page_count);
-	atomic_add32(&_unmapped_total, (int32_t)page_count);
-#endif
+_memory_unmap(void* ptr, size_t page_count, size_t align_offset) {
+	void* mapped_ptr = (void*) (((uintptr_t) ptr) - align_offset);
 
-#ifdef PLATFORM_WINDOWS
-	VirtualFree(ptr, 0, MEM_RELEASE);
-	(void)sizeof(page_count);
-#else
-	munmap(ptr, PAGE_SIZE * page_count);
+	if (align_offset != 0)
+		page_count += (SPAN_ADDRESS_GRANULARITY / PAGE_SIZE);
+
+	_memory_config.memory_unmap(mapped_ptr, page_count * PAGE_SIZE);
+
+#if ENABLE_STATISTICS
+	atomic_add32(&_mapped_pages,  -(int32_t)page_count);
+	atomic_add32(&_unmapped_total, (int32_t)page_count);
 #endif
 }
 

@@ -66,8 +66,18 @@ typedef struct rpmalloc_thread_statistics_t {
 	size_t global_to_thread;
 } rpmalloc_thread_statistics_t;
 
+typedef struct rpmalloc_config_t {
+	//! Map a block of address space
+	void *(*memory_map)(size_t size);
+	// Unmap a previously mapped block of memory
+	void (*memory_unmap)(void *ptr, size_t size);
+} rpmalloc_config_t;
+
 extern int
 rpmalloc_initialize(void);
+
+extern int
+rpmalloc_initialize_config(const rpmalloc_config_t* config);
 
 extern void
 rpmalloc_finalize(void);
